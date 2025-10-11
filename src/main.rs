@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use wgpu::wgt;
 use winit::{
@@ -24,19 +24,24 @@ struct AppWgpu {
 
 impl AppWgpu {
     async fn new(window: Arc<Window>) -> Self {
+        let ts_init_begin = Instant::now();
         let wgpu = wgpu::Instance::new(&wgt::InstanceDescriptor {
-            #[cfg(target_os = "windows")]
-            backends: wgt::Backends::DX12,
-            #[cfg(not(target_os = "windows"))]
-            backends: wgt::Backends::PRIMARY,
-            flags: wgt::InstanceFlags::DEBUG
-                | wgt::InstanceFlags::VALIDATION
-                | wgt::InstanceFlags::GPU_BASED_VALIDATION
-                | wgt::InstanceFlags::VALIDATION_INDIRECT_CALL,
+            // #[cfg(target_os = "windows")]
+            // backends: wgt::Backends::DX12,
+            // #[cfg(not(target_os = "windows"))]
+            backends: wgt::Backends::VULKAN,
+            // flags: wgt::InstanceFlags::DEBUG
+            //     | wgt::InstanceFlags::VALIDATION
+            //     | wgt::InstanceFlags::GPU_BASED_VALIDATION
+            //     | wgt::InstanceFlags::VALIDATION_INDIRECT_CALL,
+            flags: wgt::InstanceFlags::empty(),
             memory_budget_thresholds: Default::default(),
             backend_options: Default::default(),
         });
+        let ts_init_instance = Instant::now();
+        let window_size = window.inner_size();
         let surface = wgpu.create_surface(window).unwrap();
+        let ts_init_surface = Instant::now();
         let adapter = wgpu
             .request_adapter(&wgt::RequestAdapterOptions {
                 power_preference: wgt::PowerPreference::HighPerformance,
@@ -45,7 +50,9 @@ impl AppWgpu {
             })
             .await
             .unwrap();
+        let ts_init_adapter = Instant::now();
         let (device, queue) = adapter.request_device(&Default::default()).await.unwrap();
+        let ts_init_device = Instant::now();
 
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps
@@ -57,14 +64,39 @@ impl AppWgpu {
         let surface_config = wgt::SurfaceConfiguration {
             usage: wgt::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
-            width: 1280,
-            height: 720,
+            width: window_size.width.max(1),
+            height: window_size.height.max(1),
             present_mode: wgt::PresentMode::AutoNoVsync,
             desired_maximum_frame_latency: 2,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: Vec::new(),
         };
         surface.configure(&device, &surface_config);
+        let ts_init_end = Instant::now();
+        print!(
+            "Wgpu init took {} seconds. Of them:\n",
+            (ts_init_end - ts_init_begin).as_secs_f64()
+        );
+        print!(
+            "    instance init took {} seconds\n",
+            (ts_init_instance - ts_init_begin).as_secs_f64()
+        );
+        print!(
+            "    surface  init took {} seconds\n",
+            (ts_init_surface - ts_init_instance).as_secs_f64()
+        );
+        print!(
+            "    adapter  init took {} seconds\n",
+            (ts_init_adapter - ts_init_surface).as_secs_f64()
+        );
+        print!(
+            "    device   init took {} seconds\n",
+            (ts_init_device - ts_init_adapter).as_secs_f64()
+        );
+        print!(
+            "    config        took {} seconds\n",
+            (ts_init_end - ts_init_device).as_secs_f64()
+        );
 
         Self {
             surface,
