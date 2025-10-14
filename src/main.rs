@@ -1,47 +1,37 @@
-use std::{sync::Arc, time::Instant};
+use sdl3::{event::Event, keyboard::Scancode, video::Window};
+use wgpu::{include_wgsl, wgt};
 
-use wgpu::wgt;
-use winit::{
-    application::ApplicationHandler,
-    event::{ElementState, KeyEvent, WindowEvent},
-    event_loop::{ActiveEventLoop, EventLoop},
-    keyboard::{KeyCode, PhysicalKey},
-    window::{Window, WindowAttributes, WindowId},
-};
+struct App {
+    window: Window,
 
-#[derive(Default)]
-struct AppTop {
-    window: Option<Arc<Window>>,
-    wgpu: Option<AppWgpu>,
-}
-
-struct AppWgpu {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface_config: wgpu::SurfaceConfiguration,
+
+    quad_idx: wgpu::Buffer,
+    pipeline: wgpu::RenderPipeline,
 }
 
-impl AppWgpu {
-    async fn new(window: Arc<Window>) -> Self {
-        let ts_init_begin = Instant::now();
+impl App {
+    async fn new(window: Window) -> Self {
         let wgpu = wgpu::Instance::new(&wgt::InstanceDescriptor {
-            // #[cfg(target_os = "windows")]
-            // backends: wgt::Backends::DX12,
-            // #[cfg(not(target_os = "windows"))]
-            backends: wgt::Backends::VULKAN,
-            // flags: wgt::InstanceFlags::DEBUG
-            //     | wgt::InstanceFlags::VALIDATION
-            //     | wgt::InstanceFlags::GPU_BASED_VALIDATION
-            //     | wgt::InstanceFlags::VALIDATION_INDIRECT_CALL,
-            flags: wgt::InstanceFlags::empty(),
+            #[cfg(target_os = "windows")]
+            backends: wgt::Backends::DX12,
+            #[cfg(not(target_os = "windows"))]
+            backends: wgt::Backends::PRIMARY,
+            flags: wgt::InstanceFlags::DEBUG
+                | wgt::InstanceFlags::VALIDATION
+                | wgt::InstanceFlags::GPU_BASED_VALIDATION
+                | wgt::InstanceFlags::VALIDATION_INDIRECT_CALL,
             memory_budget_thresholds: Default::default(),
             backend_options: Default::default(),
         });
-        let ts_init_instance = Instant::now();
-        let window_size = window.inner_size();
-        let surface = wgpu.create_surface(window).unwrap();
-        let ts_init_surface = Instant::now();
+        let window_size = window.size_in_pixels();
+        let surface = unsafe {
+            let target = wgpu::SurfaceTargetUnsafe::from_window(&window).unwrap();
+            wgpu.create_surface_unsafe(target).unwrap()
+        };
         let adapter = wgpu
             .request_adapter(&wgt::RequestAdapterOptions {
                 power_preference: wgt::PowerPreference::HighPerformance,
@@ -50,9 +40,7 @@ impl AppWgpu {
             })
             .await
             .unwrap();
-        let ts_init_adapter = Instant::now();
         let (device, queue) = adapter.request_device(&Default::default()).await.unwrap();
-        let ts_init_device = Instant::now();
 
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps
@@ -64,80 +52,94 @@ impl AppWgpu {
         let surface_config = wgt::SurfaceConfiguration {
             usage: wgt::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
-            width: window_size.width.max(1),
-            height: window_size.height.max(1),
+            width: window_size.0.max(1),
+            height: window_size.1.max(1),
             present_mode: wgt::PresentMode::AutoNoVsync,
             desired_maximum_frame_latency: 2,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: Vec::new(),
         };
         surface.configure(&device, &surface_config);
-        let ts_init_end = Instant::now();
-        print!(
-            "Wgpu init took {} seconds. Of them:\n",
-            (ts_init_end - ts_init_begin).as_secs_f64()
-        );
-        print!(
-            "    instance init took {} seconds\n",
-            (ts_init_instance - ts_init_begin).as_secs_f64()
-        );
-        print!(
-            "    surface  init took {} seconds\n",
-            (ts_init_surface - ts_init_instance).as_secs_f64()
-        );
-        print!(
-            "    adapter  init took {} seconds\n",
-            (ts_init_adapter - ts_init_surface).as_secs_f64()
-        );
-        print!(
-            "    device   init took {} seconds\n",
-            (ts_init_device - ts_init_adapter).as_secs_f64()
-        );
-        print!(
-            "    config        took {} seconds\n",
-            (ts_init_end - ts_init_device).as_secs_f64()
-        );
+
+        let quad_idx = device.create_buffer(&wgt::BufferDescriptor {
+            label: None,
+            size: 12,
+            usage: wgt::BufferUsages::INDEX,
+            mapped_at_creation: true,
+        });
+        {
+            let mut quad_idx_map = quad_idx.get_mapped_range_mut(..);
+            for (i, &w) in [0u16, 1, 2, 2, 1, 3].iter().enumerate() {
+                quad_idx_map[2 * i..][..2].copy_from_slice(&w.to_ne_bytes());
+            }
+        }
+        quad_idx.unmap();
+
+        let shader_module_desc = include_wgsl!("main.wgsl");
+        let shader_module = device.create_shader_module(shader_module_desc);
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: None,
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &shader_module,
+                entry_point: None,
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgt::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgt::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgt::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader_module,
+                entry_point: None,
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgt::BlendState::ALPHA_BLENDING),
+                    write_mask: wgt::ColorWrites::ALL,
+                })],
+            }),
+            multiview: None,
+            cache: None,
+        });
 
         Self {
+            window,
+
             surface,
             device,
             queue,
             surface_config,
+
+            quad_idx,
+            pipeline,
         }
     }
-}
 
-macro_rules! field {
-    ($this:ident.$name:ident !! $ret_stmt:stmt) => {
-        let Some(ref mut $name) = $this.$name else {
-            $ret_stmt
-        };
-    };
-}
-
-impl AppTop {
     fn on_resize(&mut self) {
-        field!(self.window !! return);
-        field!(self.wgpu !! return);
-
-        let size = window.inner_size();
-        if size.width > 0 && size.height > 0 {
-            wgpu.surface_config.width = size.width;
-            wgpu.surface_config.height = size.height;
-            wgpu.surface.configure(&wgpu.device, &wgpu.surface_config);
+        let (width, height) = self.window.size_in_pixels();
+        if width > 0 && height > 0 {
+            self.surface_config.width = width;
+            self.surface_config.height = height;
+            self.surface.configure(&self.device, &self.surface_config);
         }
     }
 
     fn on_frame(&mut self) -> Result<(), wgpu::SurfaceError> {
-        field!(self.window !! return Ok(()));
-        field!(self.wgpu !! return Ok(()));
-
-        window.request_redraw();
-        let out_tex = wgpu.surface.get_current_texture()?;
+        let out_tex = self.surface.get_current_texture()?;
         let out_tex_view = out_tex.texture.create_view(&Default::default());
-        let mut encoder = wgpu.device.create_command_encoder(&Default::default());
+        let mut encoder = self.device.create_command_encoder(&Default::default());
         {
-            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &out_tex_view,
@@ -152,57 +154,44 @@ impl AppTop {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            render_pass.set_pipeline(&self.pipeline);
+            let quad_idx_slice = self.quad_idx.slice(..);
+            render_pass.set_index_buffer(quad_idx_slice, wgpu::IndexFormat::Uint16);
+            render_pass.draw_indexed(0..6, 0, 0..1);
         }
-        wgpu.queue.submit(std::iter::once(encoder.finish()));
+        self.queue.submit(std::iter::once(encoder.finish()));
         out_tex.present();
         Ok(())
     }
 }
 
-impl ApplicationHandler for AppTop {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-        let window = Arc::new(
-            event_loop
-                .create_window(WindowAttributes::default())
-                .unwrap(),
-        );
-        let self_wgpu = pollster::block_on(AppWgpu::new(window.clone()));
-        self.window = Some(window);
-        self.wgpu = Some(self_wgpu);
-    }
-
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
-        event: WindowEvent,
-    ) {
-        match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(KeyCode::Escape),
-                        state: ElementState::Pressed,
-                        ..
-                    },
-                ..
-            } => event_loop.exit(),
-            WindowEvent::RedrawRequested => match self.on_frame() {
-                Ok(()) => {}
-                Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => self.on_resize(),
-                Err(err) => panic!("{err}"),
-            },
-            _ => {}
-        }
-    }
-}
-
 fn main() {
-    let event_loop = EventLoop::new().unwrap();
-    let mut app = AppTop::default();
-    event_loop.run_app(&mut app).unwrap();
+    let sdl = sdl3::init().unwrap();
+    let sdl_video = sdl.video().unwrap();
+    let mut sdl_event_pump = sdl.event_pump().unwrap();
+    let sdl_window = sdl_video
+        .window("Main window", 1280, 720)
+        .resizable()
+        .build()
+        .unwrap();
+    let mut app = pollster::block_on(App::new(sdl_window.clone()));
+    'main_loop: loop {
+        while let Some(event) = sdl_event_pump.poll_event() {
+            match event {
+                Event::Quit { .. } => break 'main_loop,
+                Event::KeyDown {
+                    scancode: Some(Scancode::Escape),
+                    ..
+                } => break 'main_loop,
+                _ => {}
+            }
+        }
+        match app.on_frame() {
+            Ok(()) => {}
+            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                app.on_resize();
+            }
+            Err(err) => panic!("{err}"),
+        }
+    }
 }
