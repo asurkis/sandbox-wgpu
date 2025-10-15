@@ -1,5 +1,13 @@
-use sdl3::{event::Event, keyboard::Scancode, video::Window};
+use std::{array, mem};
+
+use sdl3::{
+    event::{Event, WindowEvent},
+    keyboard::Scancode,
+    video::Window,
+};
 use wgpu::{include_wgsl, wgt};
+
+const PRIMITIVE_BUFFER_SIZE: u64 = 1 << 24;
 
 struct App {
     window: Window,
@@ -10,7 +18,24 @@ struct App {
     surface_config: wgpu::SurfaceConfiguration,
 
     quad_idx: wgpu::Buffer,
-    pipeline: wgpu::RenderPipeline,
+
+    current_frame: usize,
+    submission_idx: [Option<wgpu::SubmissionIndex>; 2],
+
+    staging_buffers: [wgpu::Buffer; 2],
+    primitive_buffer_gpu: wgpu::Buffer,
+    primitive_buffer_offset: u64,
+    primitive_count: u32,
+
+    primitive_pipeline_fill_rect: wgpu::RenderPipeline,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PrimitiveRect {
+    #[allow(unused)]
+    pos: [f32; 4],
+    #[allow(unused)]
+    color: [f32; 4],
 }
 
 impl App {
@@ -54,7 +79,7 @@ impl App {
             format: surface_format,
             width: window_size.0.max(1),
             height: window_size.1.max(1),
-            present_mode: wgt::PresentMode::AutoNoVsync,
+            present_mode: wgt::PresentMode::AutoVsync,
             desired_maximum_frame_latency: 2,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: Vec::new(),
@@ -75,42 +100,74 @@ impl App {
         }
         quad_idx.unmap();
 
+        let staging_buffers = array::from_fn(|_| {
+            device.create_buffer(&wgt::BufferDescriptor {
+                label: None,
+                size: PRIMITIVE_BUFFER_SIZE,
+                usage: wgt::BufferUsages::COPY_SRC | wgt::BufferUsages::MAP_WRITE,
+                mapped_at_creation: true,
+            })
+        });
+
+        let primitive_buffer_gpu = device.create_buffer(&wgt::BufferDescriptor {
+            label: None,
+            size: PRIMITIVE_BUFFER_SIZE,
+            usage: wgt::BufferUsages::COPY_DST | wgt::BufferUsages::VERTEX,
+            mapped_at_creation: false,
+        });
+
         let shader_module_desc = include_wgsl!("main.wgsl");
         let shader_module = device.create_shader_module(shader_module_desc);
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: None,
-            layout: None,
-            vertex: wgpu::VertexState {
-                module: &shader_module,
-                entry_point: None,
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgt::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgt::FrontFace::Ccw,
-                cull_mode: None,
-                unclipped_depth: false,
-                polygon_mode: wgt::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader_module,
-                entry_point: None,
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgt::BlendState::ALPHA_BLENDING),
-                    write_mask: wgt::ColorWrites::ALL,
-                })],
-            }),
-            multiview: None,
-            cache: None,
-        });
+        let primitive_pipeline_fill_rect =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: None,
+                layout: None,
+                vertex: wgpu::VertexState {
+                    module: &shader_module,
+                    entry_point: None,
+                    compilation_options: Default::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: 32,
+                        step_mode: wgt::VertexStepMode::Instance,
+                        attributes: &[
+                            wgt::VertexAttribute {
+                                format: wgt::VertexFormat::Float32x4,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            wgt::VertexAttribute {
+                                format: wgt::VertexFormat::Float32x4,
+                                offset: 16,
+                                shader_location: 1,
+                            },
+                        ],
+                    }],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgt::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgt::FrontFace::Ccw,
+                    cull_mode: None,
+                    unclipped_depth: false,
+                    polygon_mode: wgt::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader_module,
+                    entry_point: None,
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgt::BlendState::ALPHA_BLENDING),
+                        write_mask: wgt::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+                cache: None,
+            });
 
         Self {
             window,
@@ -121,7 +178,16 @@ impl App {
             surface_config,
 
             quad_idx,
-            pipeline,
+
+            current_frame: 0,
+            submission_idx: array::from_fn(|_| None),
+
+            staging_buffers,
+            primitive_buffer_gpu,
+            primitive_buffer_offset: 0,
+            primitive_count: 0,
+
+            primitive_pipeline_fill_rect,
         }
     }
 
@@ -139,6 +205,26 @@ impl App {
         let out_tex_view = out_tex.texture.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
+            self.primitive_buffer_offset = 0;
+            self.primitive_count = 0;
+            {
+                if let Some(idx) = mem::take(&mut self.submission_idx[self.current_frame]) {
+                    let poll_type = wgpu::PollType::Wait {
+                        submission_index: Some(idx),
+                        timeout: None,
+                    };
+                    self.device.poll(poll_type).unwrap();
+                }
+                let cur_buf = &self.staging_buffers[self.current_frame];
+                let mut mapping = cur_buf.get_mapped_range_mut(..);
+                self.fill_rect(&mut mapping, [0, 0, 100, 100], [1.0; 4]);
+                self.fill_rect(&mut mapping, [100, 100, 200, 200], [0.0, 1.0, 0.0, 1.0]);
+                let _ = mapping;
+            }
+            let cur_buf = &self.staging_buffers[self.current_frame];
+            cur_buf.unmap();
+            encoder.copy_buffer_to_buffer(cur_buf, 0, &self.primitive_buffer_gpu, 0, None);
+
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -154,14 +240,57 @@ impl App {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            render_pass.set_pipeline(&self.pipeline);
-            let quad_idx_slice = self.quad_idx.slice(..);
-            render_pass.set_index_buffer(quad_idx_slice, wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..6, 0, 0..1);
+            self.flush_primitives(&mut render_pass);
         }
-        self.queue.submit(std::iter::once(encoder.finish()));
+        let cur_buf = &self.staging_buffers[self.current_frame];
+        encoder.map_buffer_on_submit(cur_buf, wgpu::MapMode::Write, .., |res| match res {
+            Ok(()) => {}
+            Err(err) => panic!("{err}"),
+        });
+        let submission_idx = self.queue.submit([encoder.finish()]);
+        self.submission_idx[self.current_frame] = Some(submission_idx);
+        self.current_frame ^= 1;
         out_tex.present();
         Ok(())
+    }
+
+    fn fill_rect(
+        &mut self,
+        mapping: &mut wgpu::BufferViewMut,
+        [left, top, right, bottom]: [i32; 4],
+        color: [f32; 4],
+    ) {
+        const SIZE: usize = mem::size_of::<PrimitiveRect>();
+        let off = 32 * self.primitive_count as usize;
+        if off + SIZE > mapping.len() {
+            eprintln!("Primitive buffer overflow");
+            return;
+        }
+        let pos = [
+            left as f32 / self.surface_config.width as f32 * 2.0 - 1.0,
+            top as f32 / self.surface_config.height as f32 * 2.0 - 1.0,
+            right as f32 / self.surface_config.width as f32 * 2.0 - 1.0,
+            bottom as f32 / self.surface_config.height as f32 * 2.0 - 1.0,
+        ];
+        let rect = PrimitiveRect { pos, color };
+        let rect: [u8; SIZE] = unsafe { mem::transmute(rect) };
+        mapping[off..][..SIZE].copy_from_slice(&rect);
+        self.primitive_count += 1;
+    }
+
+    fn flush_primitives(&mut self, render_pass: &mut wgpu::RenderPass) {
+        const SIZE: usize = mem::size_of::<PrimitiveRect>();
+        render_pass.set_pipeline(&self.primitive_pipeline_fill_rect);
+        let first = self.primitive_buffer_offset;
+        let width = SIZE as u64 * self.primitive_count as u64;
+        let last = first + width;
+        let primitive_buffer_slice_gpu = self.primitive_buffer_gpu.slice(first..last);
+        let quad_idx_slice = self.quad_idx.slice(..);
+        render_pass.set_pipeline(&self.primitive_pipeline_fill_rect);
+        render_pass.set_index_buffer(quad_idx_slice, wgpu::IndexFormat::Uint16);
+        render_pass.set_vertex_buffer(0, primitive_buffer_slice_gpu);
+        render_pass.draw_indexed(0..6, 0, 0..self.primitive_count);
+        self.primitive_buffer_offset = last;
     }
 }
 
@@ -179,6 +308,12 @@ fn main() {
         while let Some(event) = sdl_event_pump.poll_event() {
             match event {
                 Event::Quit { .. } => break 'main_loop,
+                Event::Window {
+                    win_event: WindowEvent::Resized(_, _),
+                    ..
+                } => {
+                    app.on_resize();
+                }
                 Event::KeyDown {
                     scancode: Some(Scancode::Escape),
                     ..
