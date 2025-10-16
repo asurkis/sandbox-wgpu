@@ -1,4 +1,7 @@
-use std::{array, mem};
+use std::{
+    array, mem,
+    time::{Duration, Instant},
+};
 
 use sdl3::{
     event::{Event, WindowEvent},
@@ -7,7 +10,7 @@ use sdl3::{
 };
 use wgpu::{include_wgsl, wgt};
 
-const PRIMITIVE_BUFFER_SIZE: u64 = 1 << 24;
+const STAGING_BUFFER_SIZE: u64 = 1 << 24;
 
 struct App {
     window: Window,
@@ -28,6 +31,7 @@ struct App {
     primitive_count: u32,
 
     primitive_pipeline_fill_rect: wgpu::RenderPipeline,
+    primitive_pipeline_fill_rect_unbuffered: wgpu::RenderPipeline,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -65,7 +69,20 @@ impl App {
             })
             .await
             .unwrap();
-        let (device, queue) = adapter.request_device(&Default::default()).await.unwrap();
+        let (device, queue) = adapter
+            .request_device(&wgt::DeviceDescriptor {
+                label: None,
+                required_features: wgt::Features::PUSH_CONSTANTS,
+                required_limits: wgt::Limits {
+                    max_push_constant_size: 32,
+                    ..Default::default()
+                },
+                experimental_features: Default::default(),
+                memory_hints: Default::default(),
+                trace: Default::default(),
+            })
+            .await
+            .unwrap();
 
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps
@@ -92,18 +109,17 @@ impl App {
             usage: wgt::BufferUsages::INDEX,
             mapped_at_creation: true,
         });
-        {
-            let mut quad_idx_map = quad_idx.get_mapped_range_mut(..);
-            for (i, &w) in [0u16, 1, 2, 2, 1, 3].iter().enumerate() {
-                quad_idx_map[2 * i..][..2].copy_from_slice(&w.to_ne_bytes());
-            }
+        let mut quad_idx_map = quad_idx.get_mapped_range_mut(..);
+        for (i, &w) in [0u16, 1, 2, 2, 1, 3].iter().enumerate() {
+            quad_idx_map[2 * i..][..2].copy_from_slice(&w.to_ne_bytes());
         }
+        mem::drop(quad_idx_map);
         quad_idx.unmap();
 
         let staging_buffers = array::from_fn(|_| {
             device.create_buffer(&wgt::BufferDescriptor {
                 label: None,
-                size: PRIMITIVE_BUFFER_SIZE,
+                size: STAGING_BUFFER_SIZE,
                 usage: wgt::BufferUsages::COPY_SRC | wgt::BufferUsages::MAP_WRITE,
                 mapped_at_creation: true,
             })
@@ -111,7 +127,7 @@ impl App {
 
         let primitive_buffer_gpu = device.create_buffer(&wgt::BufferDescriptor {
             label: None,
-            size: PRIMITIVE_BUFFER_SIZE,
+            size: STAGING_BUFFER_SIZE,
             usage: wgt::BufferUsages::COPY_DST | wgt::BufferUsages::VERTEX,
             mapped_at_creation: false,
         });
@@ -119,6 +135,15 @@ impl App {
         let shader_module_desc = include_wgsl!("main.wgsl");
         let shader_module = device.create_shader_module(shader_module_desc);
 
+        let primitive = wgpu::PrimitiveState {
+            topology: wgt::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgt::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgt::PolygonMode::Fill,
+            conservative: false,
+        };
         let primitive_pipeline_fill_rect =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: None,
@@ -144,19 +169,51 @@ impl App {
                         ],
                     }],
                 },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgt::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgt::FrontFace::Ccw,
-                    cull_mode: None,
-                    unclipped_depth: false,
-                    polygon_mode: wgt::PolygonMode::Fill,
-                    conservative: false,
-                },
+                primitive,
                 depth_stencil: None,
                 multisample: Default::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &shader_module,
+                    entry_point: None,
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgt::BlendState::ALPHA_BLENDING),
+                        write_mask: wgt::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+                cache: None,
+            });
+
+        let shader_module_unbuffered_desc = include_wgsl!("main_unbuffered.wgsl");
+        let shader_module_unbuffered = device.create_shader_module(shader_module_unbuffered_desc);
+
+        let unbuffered_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[],
+                push_constant_ranges: &[wgt::PushConstantRange {
+                    stages: wgt::ShaderStages::VERTEX,
+                    range: 0..32,
+                }],
+            });
+
+        let primitive_pipeline_fill_rect_unbuffered =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: None,
+                layout: Some(&unbuffered_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader_module_unbuffered,
+                    entry_point: None,
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive,
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader_module_unbuffered,
                     entry_point: None,
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
@@ -188,6 +245,7 @@ impl App {
             primitive_count: 0,
 
             primitive_pipeline_fill_rect,
+            primitive_pipeline_fill_rect_unbuffered,
         }
     }
 
@@ -200,53 +258,74 @@ impl App {
         }
     }
 
-    fn on_frame(&mut self) -> Result<(), wgpu::SurfaceError> {
+    fn on_frame(&mut self, use_push_constants: bool) -> Result<(), wgpu::SurfaceError> {
         let out_tex = self.surface.get_current_texture()?;
         let out_tex_view = out_tex.texture.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        {
+        if let Some(idx) = mem::take(&mut self.submission_idx[self.current_frame]) {
+            let poll_type = wgpu::PollType::Wait {
+                submission_index: Some(idx),
+                timeout: None,
+            };
+            self.device.poll(poll_type).unwrap();
+        }
+        let render_pass_desc = wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &out_tex_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgt::Operations {
+                    load: wgt::LoadOp::Clear(wgt::Color::BLUE),
+                    store: wgt::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        };
+        if use_push_constants {
+            let mut render_pass = encoder.begin_render_pass(&render_pass_desc);
+            let quad_idx_slice = self.quad_idx.slice(..);
+            render_pass.set_pipeline(&self.primitive_pipeline_fill_rect_unbuffered);
+            render_pass.set_index_buffer(quad_idx_slice, wgpu::IndexFormat::Uint16);
+            for y in 0..64 {
+                for x in 0..64 {
+                    let pos = [12 * x + 6, 12 * y + 6, 12 * x + 12, 12 * y + 12];
+                    let color = [1.0; 4];
+                    let bytes = self.rect_to_bytes(pos, color);
+                    render_pass.set_push_constants(wgt::ShaderStages::VERTEX, 0, &bytes);
+                    render_pass.draw_indexed(0..6, 0, 0..1);
+                }
+            }
+        } else {
             self.primitive_buffer_offset = 0;
             self.primitive_count = 0;
-            {
-                if let Some(idx) = mem::take(&mut self.submission_idx[self.current_frame]) {
-                    let poll_type = wgpu::PollType::Wait {
-                        submission_index: Some(idx),
-                        timeout: None,
-                    };
-                    self.device.poll(poll_type).unwrap();
+            let cur_buf = &self.staging_buffers[self.current_frame];
+            let mut mapping = cur_buf.get_mapped_range_mut(..);
+            for y in 0..64 {
+                for x in 0..64 {
+                    let pos = [12 * x + 6, 12 * y + 6, 12 * x + 12, 12 * y + 12];
+                    let color = [1.0; 4];
+                    self.fill_rect(&mut mapping, pos, color);
                 }
-                let cur_buf = &self.staging_buffers[self.current_frame];
-                let mut mapping = cur_buf.get_mapped_range_mut(..);
-                self.fill_rect(&mut mapping, [0, 0, 100, 100], [1.0; 4]);
-                self.fill_rect(&mut mapping, [100, 100, 200, 200], [0.0, 1.0, 0.0, 1.0]);
-                let _ = mapping;
             }
+            mem::drop(mapping);
             let cur_buf = &self.staging_buffers[self.current_frame];
             cur_buf.unmap();
             encoder.copy_buffer_to_buffer(cur_buf, 0, &self.primitive_buffer_gpu, 0, None);
 
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &out_tex_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgt::Operations {
-                        load: wgt::LoadOp::Clear(wgt::Color::BLUE),
-                        store: wgt::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
+            let mut render_pass = encoder.begin_render_pass(&render_pass_desc);
             self.flush_primitives(&mut render_pass);
+            mem::drop(render_pass);
+
+            let cur_buf = &self.staging_buffers[self.current_frame];
+            encoder.map_buffer_on_submit(cur_buf, wgpu::MapMode::Write, .., |res| match res {
+                Ok(()) => {}
+                Err(err) => panic!("{err}"),
+            });
         }
-        let cur_buf = &self.staging_buffers[self.current_frame];
-        encoder.map_buffer_on_submit(cur_buf, wgpu::MapMode::Write, .., |res| match res {
-            Ok(()) => {}
-            Err(err) => panic!("{err}"),
-        });
+
         let submission_idx = self.queue.submit([encoder.finish()]);
         self.submission_idx[self.current_frame] = Some(submission_idx);
         self.current_frame ^= 1;
@@ -254,18 +333,7 @@ impl App {
         Ok(())
     }
 
-    fn fill_rect(
-        &mut self,
-        mapping: &mut wgpu::BufferViewMut,
-        [left, top, right, bottom]: [i32; 4],
-        color: [f32; 4],
-    ) {
-        const SIZE: usize = mem::size_of::<PrimitiveRect>();
-        let off = 32 * self.primitive_count as usize;
-        if off + SIZE > mapping.len() {
-            eprintln!("Primitive buffer overflow");
-            return;
-        }
+    fn rect_to_bytes(&self, [left, top, right, bottom]: [i32; 4], color: [f32; 4]) -> [u8; 32] {
         let pos = [
             left as f32 / self.surface_config.width as f32 * 2.0 - 1.0,
             top as f32 / self.surface_config.height as f32 * 2.0 - 1.0,
@@ -273,7 +341,17 @@ impl App {
             bottom as f32 / self.surface_config.height as f32 * 2.0 - 1.0,
         ];
         let rect = PrimitiveRect { pos, color };
-        let rect: [u8; SIZE] = unsafe { mem::transmute(rect) };
+        unsafe { mem::transmute(rect) }
+    }
+
+    fn fill_rect(&mut self, mapping: &mut wgpu::BufferViewMut, pos: [i32; 4], color: [f32; 4]) {
+        const SIZE: usize = mem::size_of::<PrimitiveRect>();
+        let off = 32 * self.primitive_count as usize;
+        if off + SIZE > mapping.len() {
+            eprintln!("Primitive buffer overflow");
+            return;
+        }
+        let rect = self.rect_to_bytes(pos, color);
         mapping[off..][..SIZE].copy_from_slice(&rect);
         self.primitive_count += 1;
     }
@@ -304,6 +382,9 @@ fn main() {
         .build()
         .unwrap();
     let mut app = pollster::block_on(App::new(sdl_window.clone()));
+    let mut use_push_constants = false;
+    let mut prev_second = Instant::now();
+    let mut frame_count = 0;
     'main_loop: loop {
         while let Some(event) = sdl_event_pump.poll_event() {
             match event {
@@ -315,18 +396,33 @@ fn main() {
                     app.on_resize();
                 }
                 Event::KeyDown {
-                    scancode: Some(Scancode::Escape),
+                    scancode: Some(scancode),
                     ..
-                } => break 'main_loop,
+                } => match scancode {
+                    Scancode::Escape => break 'main_loop,
+                    Scancode::F => use_push_constants ^= true,
+                    _ => {}
+                },
                 _ => {}
             }
         }
-        match app.on_frame() {
+        match app.on_frame(use_push_constants) {
             Ok(()) => {}
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
                 app.on_resize();
             }
             Err(err) => panic!("{err}"),
+        }
+        frame_count += 1;
+        let curr_ts = Instant::now();
+        let duration = curr_ts - prev_second;
+        if duration > Duration::from_secs(1) {
+            println!(
+                "use_push_constants: {use_push_constants}; FPS: {}",
+                frame_count as f64 / duration.as_secs_f64()
+            );
+            frame_count = 0;
+            prev_second = curr_ts;
         }
     }
 }
