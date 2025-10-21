@@ -1,3 +1,4 @@
+mod font;
 mod primitives;
 mod program;
 
@@ -10,7 +11,8 @@ use sdl3::{
 
 fn main() {
     let mut program_ctx = pollster::block_on(program::Context::new());
-    let mut primitives = PrimitiveList::new();
+    let mut primitives = PrimitiveList::default();
+    let font = font::Font::new(&program_ctx);
 
     const WINDOW_PADDING: f32 = 8.0;
     const GRID_STEP: f32 = 8.0;
@@ -114,6 +116,26 @@ fn main() {
             program_ctx.surface_config.width,
             program_ctx.surface_config.height,
         ];
+
+        primitives.texture = Some(font.texture.clone());
+        primitives.px_space = false;
+        primitives.color = [1.0, 0.0, 0.0, 1.0];
+        primitives.tex_coord = [0.0, 1.0];
+        let idx1 = primitives.vertex_2f([0.0, 0.0]);
+        primitives.tex_coord = [1.0, 1.0];
+        let idx2 = primitives.vertex_2f([1.0, 0.0]);
+        primitives.tex_coord = [0.0, 0.0];
+        let idx3 = primitives.vertex_2f([0.0, 1.0]);
+        primitives.tex_coord = [1.0, 0.0];
+        let idx4 = primitives.vertex_2f([1.0, 1.0]);
+        primitives.push_index(idx1);
+        primitives.push_index(idx2);
+        primitives.push_index(idx3);
+        primitives.push_index(idx4);
+        primitives.push_index(idx3);
+        primitives.push_index(idx2);
+
+        primitives.texture = None;
         primitives.px_space = true;
         primitives.color = [1.0; 4];
         primitives.rect_4f(window_pos);

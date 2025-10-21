@@ -1,16 +1,21 @@
 use sdl3::{EventPump, video::Window};
 use std::{array, mem};
-use wgpu::{include_wgsl, wgt};
+use wgpu::wgt;
 
-use crate::primitives::{PrimitiveList, PrimitiveVertex};
+use crate::primitives::{PrimitiveList, Vertex};
 
 pub const STAGING_BUFFER_SIZE: u64 = 1 << 24;
 
 pub struct Context {
     pub primitive_pipeline: wgpu::RenderPipeline,
+    pub primitive_pipeline_layout: wgpu::PipelineLayout,
+    pub primitive_pipeline_bind_group_layout: wgpu::BindGroupLayout,
     pub primitive_buffer: wgpu::Buffer,
     pub staging_buffers: [wgpu::Buffer; 2],
     pub submission_idx: [Option<wgpu::SubmissionIndex>; 2],
+    pub white_tex_view: wgpu::TextureView,
+    pub white_tex: wgpu::Texture,
+    pub default_sampler: wgpu::Sampler,
     pub current_frame: usize,
     pub surface_config: wgpu::SurfaceConfiguration,
     pub queue: wgpu::Queue,
@@ -76,6 +81,36 @@ impl Context {
         };
         surface.configure(&device, &surface_config);
 
+        let default_sampler = device.create_sampler(&Default::default());
+
+        let white_tex_size = wgt::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        };
+        let white_tex = device.create_texture(&wgt::TextureDescriptor {
+            label: Some("White texture"),
+            size: white_tex_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgt::TextureDimension::D2,
+            format: wgt::TextureFormat::Rgba8Unorm,
+            usage: wgt::TextureUsages::COPY_DST | wgt::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[wgt::TextureFormat::Rgba8Unorm],
+        });
+        let white_tex_view = white_tex.create_view(&Default::default());
+        queue.write_texture(
+            wgt::TexelCopyTextureInfo {
+                texture: &white_tex,
+                mip_level: 0,
+                origin: wgt::Origin3d::ZERO,
+                aspect: wgt::TextureAspect::All,
+            },
+            &[255; 4],
+            Default::default(),
+            white_tex_size,
+        );
+
         let staging_buffers = array::from_fn(|i| {
             device.create_buffer(&wgt::BufferDescriptor {
                 label: Some(&format!("Staging buffer {i}")),
@@ -94,29 +129,64 @@ impl Context {
             mapped_at_creation: false,
         });
 
-        let shader_module_desc = include_wgsl!("primitives.wgsl");
+        let shader_module_desc = wgpu::include_wgsl!("primitives.wgsl");
         let shader_module = device.create_shader_module(shader_module_desc);
+
+        let primitive_pipeline_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Primitive pipeline bind group layout"),
+                entries: &[
+                    wgt::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgt::ShaderStages::FRAGMENT,
+                        ty: wgt::BindingType::Texture {
+                            sample_type: wgt::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgt::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgt::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgt::ShaderStages::FRAGMENT,
+                        ty: wgt::BindingType::Sampler(wgt::SamplerBindingType::NonFiltering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let primitive_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Primitive pipeline layout"),
+                bind_group_layouts: &[&primitive_pipeline_bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
         let primitive_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Primitive pipeline"),
-            layout: None,
+            layout: Some(&primitive_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader_module,
                 entry_point: None,
                 compilation_options: Default::default(),
                 buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: mem::size_of::<PrimitiveVertex>() as u64,
+                    array_stride: mem::size_of::<Vertex>() as u64,
                     step_mode: wgt::VertexStepMode::Vertex,
                     attributes: &[
                         wgt::VertexAttribute {
                             format: wgt::VertexFormat::Float32x2,
-                            offset: mem::offset_of!(PrimitiveVertex, coord) as u64,
+                            offset: mem::offset_of!(Vertex, coord) as u64,
                             shader_location: 0,
                         },
                         wgt::VertexAttribute {
                             format: wgt::VertexFormat::Float32x4,
-                            offset: mem::offset_of!(PrimitiveVertex, color) as u64,
+                            offset: mem::offset_of!(Vertex, color) as u64,
                             shader_location: 1,
+                        },
+                        wgt::VertexAttribute {
+                            format: wgt::VertexFormat::Float32x2,
+                            offset: mem::offset_of!(Vertex, tex_coord) as u64,
+                            shader_location: 2,
                         },
                     ],
                 }],
@@ -140,9 +210,14 @@ impl Context {
 
         Self {
             primitive_pipeline,
+            primitive_pipeline_layout,
+            primitive_pipeline_bind_group_layout,
             primitive_buffer,
             staging_buffers,
             submission_idx: array::from_fn(|_| None),
+            white_tex_view,
+            white_tex,
+            default_sampler,
             current_frame: 0,
             surface_config,
             queue,
@@ -175,16 +250,17 @@ impl Context {
         }
         let staging = &self.staging_buffers[self.current_frame];
         let mut mapping = staging.get_mapped_range_mut(..);
-        let off_idx = 0;
-        let (off_vtx, count_idx) = calc_count(off_idx, &primitives.idx);
-        let (off_end, count_vtx) = calc_count(off_vtx, &primitives.vtx);
-        for (i, v) in primitives.idx[..count_idx].iter().enumerate() {
-            let off = off_idx + i * mem::size_of_val(v);
-            mapping[off..][..4].copy_from_slice(&v.to_ne_bytes());
-        }
+        let off_vtx = 0;
+        let (off_idx, count_vtx) = calc_count(off_vtx, &primitives.vtx);
+        let (off_end, count_idx) = calc_count(off_idx, &primitives.idx);
         for (i, v) in primitives.vtx[..count_vtx].iter().enumerate() {
             let mut off = off_vtx + i * mem::size_of_val(v);
             for x in v.coord {
+                let size = mem::size_of_val(&x);
+                mapping[off..][..size].copy_from_slice(&x.to_ne_bytes());
+                off += size;
+            }
+            for x in v.tex_coord {
                 let size = mem::size_of_val(&x);
                 mapping[off..][..size].copy_from_slice(&x.to_ne_bytes());
                 off += size;
@@ -194,6 +270,10 @@ impl Context {
                 mapping[off..][..size].copy_from_slice(&x.to_ne_bytes());
                 off += size;
             }
+        }
+        for (i, v) in primitives.idx[..count_idx].iter().enumerate() {
+            let off = off_idx + i * mem::size_of_val(v);
+            mapping[off..][..4].copy_from_slice(&v.to_ne_bytes());
         }
         let off_vtx = off_vtx as u64;
         let off_idx = off_idx as u64;
@@ -216,13 +296,35 @@ impl Context {
             })],
             ..Default::default()
         });
-        render_pass.set_pipeline(&self.primitive_pipeline);
-        let buf_slice_idx = self.primitive_buffer.slice(off_idx..off_vtx);
-        let buf_slice_vtx = self.primitive_buffer.slice(off_vtx..off_end);
+        let buf_slice_vtx = self.primitive_buffer.slice(off_vtx..off_idx);
+        let buf_slice_idx = self.primitive_buffer.slice(off_idx..off_end);
         render_pass.set_pipeline(&self.primitive_pipeline);
         render_pass.set_index_buffer(buf_slice_idx, wgpu::IndexFormat::Uint32);
         render_pass.set_vertex_buffer(0, buf_slice_vtx);
-        render_pass.draw_indexed(0..count_idx as u32, 0, 0..1);
+        for cmd in &primitives.commands {
+            let texture_view = match cmd.texture {
+                None => &self.white_tex_view,
+                Some(ref tex) => &tex.create_view(&Default::default()),
+            };
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.primitive_pipeline_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.default_sampler),
+                    },
+                ],
+            });
+            render_pass.set_bind_group(0, &bind_group, &[]);
+            let cmd_idx_off = count_idx.min(cmd.idx_off) as u32;
+            let cmd_idx_cnt = count_idx.min(cmd.idx_off + cmd.idx_cnt) as u32;
+            render_pass.draw_indexed(cmd_idx_off..cmd_idx_cnt, 0, 0..1);
+        }
         mem::drop(render_pass);
 
         let staging = &self.staging_buffers[self.current_frame];
