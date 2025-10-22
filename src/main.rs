@@ -117,35 +117,29 @@ fn main() {
             program_ctx.surface_config.height,
         ];
 
-        primitives.texture = Some(font.texture.clone());
-        primitives.px_space = false;
-        primitives.color = [1.0, 0.0, 0.0, 1.0];
-        primitives.tex_coord = [0.0, 1.0];
-        let idx1 = primitives.vertex_2f([0.0, 0.0]);
-        primitives.tex_coord = [1.0, 1.0];
-        let idx2 = primitives.vertex_2f([1.0, 0.0]);
-        primitives.tex_coord = [0.0, 0.0];
-        let idx3 = primitives.vertex_2f([0.0, 1.0]);
-        primitives.tex_coord = [1.0, 0.0];
-        let idx4 = primitives.vertex_2f([1.0, 1.0]);
-        primitives.push_index(idx1);
-        primitives.push_index(idx2);
-        primitives.push_index(idx3);
-        primitives.push_index(idx4);
-        primitives.push_index(idx3);
-        primitives.push_index(idx2);
-
         primitives.texture = None;
         primitives.px_space = true;
         primitives.color = [1.0; 4];
-        primitives.rect_4f(window_pos);
-        primitives.color = [0.5, 0.5, 0.5, 1.0];
-        primitives.rect_4f([
+        primitives.rect_f(window_pos);
+        primitives.color = [0.75, 0.75, 0.75, 1.0];
+        primitives.rect_f([
             window_pos[0] + WINDOW_PADDING,
             window_pos[1] + WINDOW_PADDING,
             window_pos[2] - WINDOW_PADDING,
             window_pos[3] - WINDOW_PADDING,
         ]);
+
+        primitives.texture = Some(font.texture.clone());
+        primitives.color = [0.0, 0.0, 0.0, 1.0];
+        primitives.text_i(
+            &font,
+            [
+                (window_pos[0] + WINDOW_PADDING) as i32,
+                (window_pos[1] + WINDOW_PADDING) as i32,
+            ],
+            "Hello, world!",
+        );
+
         match program_ctx.on_frame(&primitives) {
             Ok(()) => {}
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {

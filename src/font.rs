@@ -10,8 +10,9 @@ const FONT_DATA: &[u8] = include_bytes!("PixelFont1.png");
 #[derive(Debug)]
 pub struct Font {
     pub texture: wgpu::Texture,
-    pub char_size: [u32; 2],
+    pub glyph_size: [u32; 2],
     pub glyphs: HashMap<char, [u32; 2]>,
+    pub fallback_glyph: [u32; 2],
 }
 
 impl Font {
@@ -26,7 +27,7 @@ impl Font {
         // Character positions are hard-coded for now
         let mut glyphs = HashMap::new();
         let rows = [
-            (112, "0123456789()[]{}<>@#$"),
+            (112, "0123456789()[]{}<>@#$¤"),
             (128, "+-*÷%=/\\|~^!?….,'\":;_"),
             (160, "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"),
             (176, "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"),
@@ -38,6 +39,7 @@ impl Font {
                 glyphs.insert(c, [16 + 12 * i as u32, pos_y]);
             }
         }
+        let fallback_glyph = glyphs[&'?'];
 
         // Currently we do not optimize texture size
         let texture_size = wgt::Extent3d {
@@ -48,7 +50,7 @@ impl Font {
         let mut texture_data = vec![0; (4 * texture_size.width * texture_size.height) as usize];
         for y in 0..png_info.height as usize {
             for x in 0..png_info.width as usize {
-                let off_buf = (x + png_info.height as usize * y) * reader.info().bytes_per_pixel();
+                let off_buf = (x + png_info.width as usize * y) * reader.info().bytes_per_pixel();
                 let off_tex = (x + texture_size.width as usize * y) * 4;
                 texture_data[off_tex..][..4].fill(if png_data[off_buf] == 21 { 255 } else { 0 });
             }
@@ -83,8 +85,9 @@ impl Font {
 
         Self {
             texture,
-            char_size: [12, 16],
+            glyph_size: [12, 16],
             glyphs,
+            fallback_glyph,
         }
     }
 }

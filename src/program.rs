@@ -191,7 +191,10 @@ impl Context {
                     ],
                 }],
             },
-            primitive: Default::default(),
+            primitive: wgt::PrimitiveState {
+                cull_mode: Some(wgt::Face::Back),
+                ..Default::default()
+            },
             depth_stencil: None,
             multisample: Default::default(),
             fragment: Some(wgpu::FragmentState {
